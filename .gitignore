@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+
+# Local data/cache
+data/games/
+data/tactics/
+
+# Generated or local notes
+Next steps
+
+# Do not upload archived app versions
+versions/
