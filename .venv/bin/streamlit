@@ -1,5 +1,5 @@
 #!/bin/sh
-'''exec' "/Users/arjunb/Documents/[01] Arjun/[02] Personal Coding Projects/[11] MyChessNotebook/.venv/bin/python" "$0" "$@"
+'''exec' "/Users/arjunb/Documents/[01] Arjun/[02] Personal Coding Projects/[11] MyChessNotebook/.venv/bin/python3.12" "$0" "$@"
 ' '''
 import sys
 from streamlit.web.cli import main
