@@ -1,5 +1,5 @@
 #!/bin/sh
-'''exec' "/Users/arjunb/Documents/[01] Arjun/[02] Personal Coding Projects/[11] LondonForWhite/.venv/bin/python" "$0" "$@"
+'''exec' "/Users/arjunb/Documents/[01] Arjun/[02] Personal Coding Projects/[11] MyChessNotebook/.venv/bin/python" "$0" "$@"
 ' '''
 # -*- coding: utf-8 -*-
 import re

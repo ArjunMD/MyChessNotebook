@@ -1,14 +1,5 @@
 """
 My Chess Notebook 
-
-Features:
-- Build and save lines (SAN move list)
-- Next-move suggestions learned from your saved lines
-- Comments attached to specific plies; auto-import comments from other saved lines that share prefixes
-- Explore mode (read-only for moves; comments remain editable only in their source game)
-- Walkthrough mode (hide comment text until revealed)
-- Coverage map across all saved lines
-- Tactics: slice a saved line into a White-to-play tactical sequence; train with randomized tactics + notes
 """
 
 import json
@@ -24,6 +15,14 @@ import streamlit as st
 import streamlit.components.v1 as components
 import chess
 import chess.svg as chess_svg
+
+import hashlib
+import chess.pgn
+import io
+import re
+
+import zipfile
+
 
 
 # ===================== App Config & Styling =====================
@@ -45,7 +44,6 @@ st.markdown(
     .moves-bubbles > span.w {{ background: rgba(34,197,94,.10); }}
     .moves-bubbles > span.b {{ background: rgba(239,68,68,.10); }}
 
-    /* marker (no longer accidentally styled as a bubble) */
     .moves-bubbles .comment-marker {{
         padding: 0;
         margin: 0 0 0 0.15rem;
@@ -123,7 +121,6 @@ TACTICS_DIR.mkdir(parents=True, exist_ok=True)
 
 # ===================== Session State =====================
 def _init_state() -> None:
-    """Seed Streamlit session_state with all keys used throughout the app."""
     ss = st.session_state
 
     defaults = {
@@ -169,14 +166,23 @@ def _init_state() -> None:
         "tactic_reveal_next": False,
         "tactic_show_notes": False,
         "tactic_show_solution": False,
-        "tactic_show_tags": False,  # optional
+        "tactic_show_tags": False, 
+        "pgn_fingerprint": None,
+        "pgn_games": [],
+        "pgn_parse_errors": [],
+        "pgn_selected_idx": 0,
+        "pgn_uploader_nonce": 0,
+        "pgn_auto_import_single": True,
+        "pgn_pending_import": False,
+        "tactic_delete_pending": None, 
+        "tactic_manage_query": "",       
+        "tactic_manage_limit": 50,       
+        "pgn_paste_text": "",
+  
     }
 
     for key, value in defaults.items():
         ss.setdefault(key, value)
-
-
-
 
 _init_state()
 
@@ -194,12 +200,7 @@ def _normalize_source(s: str) -> str:
 def _norm_san(s: str) -> str:
     return san_match_key(s)
 
-
 def normalize_castling_san(s: str) -> str:
-    """
-    Accept user inputs like 0-0, 0-0-0, o-o, o-o-o (optionally with +/#),
-    and normalize to python-chess SAN: O-O / O-O-O (with same suffix).
-    """
     s = (s or "").strip()
     if not s:
         return s
@@ -218,8 +219,6 @@ def normalize_castling_san(s: str) -> str:
         return "O-O-O" + suffix
 
     return core + suffix
-
-
 
 def _read_json(path: Path) -> dict | None:
     try:
@@ -313,6 +312,636 @@ def parse_san_lenient(board: chess.Board, user_text: str) -> tuple[chess.Move | 
 
     return None, []
 
+def _pgn_fingerprint(name: str, b: bytes) -> str:
+    h = hashlib.md5()
+    h.update((name or "").encode("utf-8", errors="ignore"))
+    h.update(b or b"")
+    return h.hexdigest()
+
+
+def _label_from_headers(headers: dict, game_num: int) -> str:
+    w = (headers.get("White") or "").strip() or "White"
+    b = (headers.get("Black") or "").strip() or "Black"
+    date = (headers.get("UTCDate") or headers.get("Date") or "").strip()
+    result = (headers.get("Result") or "").strip()
+    parts = [f"{game_num}. {w} vs {b}"]
+    if date:
+        parts.append(date)
+    if result and result != "*":
+        parts.append(result)
+    return " — ".join(parts)
+
+
+def _default_source_from_headers(headers: dict) -> str:
+    w = (headers.get("White") or "").strip()
+    b = (headers.get("Black") or "").strip()
+    date = (headers.get("UTCDate") or headers.get("Date") or "").strip()
+    event = (headers.get("Event") or "").strip()
+
+    core = ""
+    if w or b:
+        core = f"{w or 'White'} vs {b or 'Black'}"
+    else:
+        core = event or "PGN Import"
+
+    if date and date != "????.??.??":
+        core += f" ({date})"
+    if event and event.lower() not in core.lower():
+        core = f"{event} — {core}"
+
+    return f"PGN: {core}"
+
+
+_RESULT_TOKENS = {"1-0", "0-1", "1/2-1/2", "*"}
+
+def _strip_pgn_variations(text: str) -> str:
+    """Remove (...) variations (best-effort, supports nesting)."""
+    out = []
+    depth = 0
+    for ch in text:
+        if ch == "(":
+            depth += 1
+            continue
+        if ch == ")":
+            depth = max(0, depth - 1)
+            continue
+        if depth == 0:
+            out.append(ch)
+    return "".join(out)
+
+def _clean_movetext(text: str) -> str:
+    """Remove comments, variations, NAGs; keep mostly SAN tokens."""
+    t = text or ""
+    # { ... } comments
+    t = re.sub(r"\{[^}]*\}", " ", t, flags=re.S)
+    # ; to end-of-line comments
+    t = re.sub(r";[^\n]*", " ", t)
+    # ( ... ) variations
+    t = _strip_pgn_variations(t)
+    # $N NAGs
+    t = re.sub(r"\$\d+", " ", t)
+    return t
+
+def _parse_movetext_line_to_san(movetext: str) -> tuple[list[str], list[str]]:
+    """
+    Parse a bare PGN movetext line (no headers) into canonical SAN list.
+    Tolerates move numbers, results, and annotation suffixes like !?!!??.
+    """
+    errors: list[str] = []
+    board = chess.Board()
+    moves_san: list[str] = []
+
+    cleaned = _clean_movetext(movetext)
+    tokens = cleaned.replace("\r", " ").replace("\n", " ").split()
+
+    for raw in tokens:
+        tok = raw.strip()
+        if not tok:
+            continue
+
+        # stop at result marker
+        if tok in _RESULT_TOKENS:
+            break
+
+        # remove leading move numbers like "12." or "12..." or "12...Qxd4"
+        tok = re.sub(r"^\d+\.(\.\.)?", "", tok).strip()
+        if not tok or tok in ("...", ".."):
+            continue
+
+        # strip common annotation glyphs at end: !, ?, !!, ??, !?, ?!, etc
+        tok = re.sub(r"[!\?]+$", "", tok).strip()
+        if not tok:
+            continue
+
+        tok = normalize_castling_san(tok)
+
+        mv, options = parse_san_lenient(board, tok)
+        if mv is None:
+            if options:
+                errors.append(
+                    f"Ambiguous token '{raw}' at ply {len(moves_san)+1}. Try one of: {', '.join(options[:8])}"
+                )
+            else:
+                errors.append(f"Could not parse token '{raw}' at ply {len(moves_san)+1}.")
+            return [], errors
+
+        san = board.san(mv)
+        board.push(mv)
+        moves_san.append(san)
+
+    if not moves_san:
+        return [], ["No moves found in pasted line/PGN."]
+
+    return moves_san, []
+
+def parse_pgn_text(pgn_text: str) -> tuple[list[dict], list[str]]:
+    """
+    Parse 1+ PGN games from text. If no PGN game structure is found, fall back to
+    parsing a bare movetext line (e.g. '1. d4 d5 2. Bf4 ...').
+    Returns ([game_dict...], errors).
+    """
+    errors: list[str] = []
+    games: list[dict] = []
+
+    text = (pgn_text or "").strip()
+    if not text:
+        return [], ["Empty PGN input."]
+
+    # --- Try standard PGN parser for 1+ games ---
+    pgn_io = io.StringIO(text)
+    game_num = 0
+    while True:
+        game = chess.pgn.read_game(pgn_io)
+        if game is None:
+            break
+
+        game_num += 1
+        headers = {k: str(v) for k, v in dict(game.headers).items()}
+
+        # Supports FEN/SetUp when present
+        try:
+            board = game.board()
+        except Exception:
+            board = chess.Board()
+
+        moves_san: list[str] = []
+        try:
+            for mv in game.mainline_moves():
+                san = board.san(mv)
+                board.push(mv)
+                moves_san.append(san)
+        except Exception as e:
+            errors.append(f"Game {game_num}: could not parse moves ({e}).")
+            continue
+
+        if not moves_san:
+            continue
+
+        site = (headers.get("Site") or "").strip()
+        url = site if site.startswith("http") else ""
+
+        source = _default_source_from_headers(headers)
+        label = _label_from_headers(headers, game_num)
+
+        games.append(
+            {
+                "label": label,
+                "headers": headers,
+                "moves_san": moves_san,
+                "comments": [],
+                "source": source,
+                "url": url,
+            }
+        )
+
+    if games:
+        return games, errors
+
+    # --- Fallback: bare movetext line ---
+    moves_san, errs = _parse_movetext_line_to_san(text)
+    if errs:
+        return [], errs
+
+    games.append(
+        {
+            "label": "1. Pasted PGN line",
+            "headers": {},
+            "moves_san": moves_san,
+            "comments": [],
+            "source": "PGN: Pasted line",
+            "url": "",
+        }
+    )
+    return games, []
+
+def parse_pgn_upload(pgn_bytes: bytes) -> tuple[list[dict], list[str]]:
+    text = (pgn_bytes or b"").decode("utf-8", errors="replace")
+    return parse_pgn_text(text)
+
+
+
+def on_import_selected_pgn(do_rerun: bool = False) -> None:
+    games = st.session_state.get("pgn_games") or []
+    if not games:
+        st.session_state.flash = "No parsed PGN games to import."
+        return
+
+    idx = _safe_int(st.session_state.get("pgn_selected_idx", 0), 0)
+    idx = max(0, min(idx, len(games) - 1))
+    g = games[idx]
+
+    # Clear current state (prevents mixing)
+    reset_all()
+
+    st.session_state.moves_san = list(g.get("moves_san") or [])
+    st.session_state.comments = list(g.get("comments") or [])
+    st.session_state.source_text = str(g.get("source") or "").strip()
+    st.session_state.url_text = str(g.get("url") or "").strip()
+
+    st.session_state.current_file = None
+    st.session_state.view_mode = "edit"
+    st.session_state.templated_from = None
+    st.session_state.loaded_snapshot = None
+
+    st.session_state.current_ply_idx = len(st.session_state.moves_san)
+    _reposition_board()
+
+    st.session_state.flash = (
+        f"Imported PGN: {st.session_state.source_text} ({len(st.session_state.moves_san)} plies)."
+    )
+
+    reset_pgn_import_ui()
+
+    # Optionally rerun when triggered outside widget callbacks
+    if do_rerun:
+        st.rerun()
+
+
+
+def reset_pgn_import_ui() -> None:
+    ss = st.session_state
+    ss.pgn_fingerprint = None
+    ss.pgn_games = []
+    ss.pgn_parse_errors = []
+    ss.pgn_selected_idx = 0
+    ss.pgn_paste_text = ""
+    ss.pgn_uploader_nonce = int(ss.get("pgn_uploader_nonce", 0)) + 1  # forces file_uploader to clear
+
+def on_parse_pgn_paste() -> None:
+    text = (st.session_state.get("pgn_paste_text") or "").strip()
+    if not text:
+        st.session_state.pgn_games = []
+        st.session_state.pgn_parse_errors = ["Paste PGN text first."]
+        st.session_state.pgn_fingerprint = None
+        return
+
+    fp = _pgn_fingerprint("PASTE_PGN", text.encode("utf-8", errors="ignore"))
+    if st.session_state.get("pgn_fingerprint") == fp:
+        return
+
+    games, errs = parse_pgn_text(text)
+    st.session_state.pgn_fingerprint = fp
+    st.session_state.pgn_games = games
+    st.session_state.pgn_parse_errors = errs
+    st.session_state.pgn_selected_idx = 0
+
+    if games and not errs and st.session_state.get("pgn_auto_import_single", True) and len(games) == 1:
+        st.session_state.pgn_pending_import = True
+
+def on_mark_pgn_pending_import() -> None:
+    st.session_state.pgn_pending_import = True
+
+
+def _unique_source_name(base: str) -> str:
+    base = (base or "").strip() or "Imported game"
+    if not _is_source_taken(base):
+        return base
+    i = 2
+    while True:
+        cand = f"{base} (import {i})"
+        if not _is_source_taken(cand):
+            return cand
+        i += 1
+
+
+def _unique_game_path(ts_hint: str | None = None) -> Path:
+    ts = (ts_hint or "").strip() or time.strftime("%Y%m%d_%H%M%S")
+    # Avoid collisions by suffixing a short uuid chunk.
+    return DATA_DIR / f"game_{ts}_{uuid.uuid4().hex[:6]}.json"
+
+
+def _unique_tactic_path(ts_hint: str | None = None) -> Path:
+    ts = (ts_hint or "").strip() or time.strftime("%Y%m%d_%H%M%S")
+    return TACTICS_DIR / f"tactic_{ts}_{uuid.uuid4().hex[:6]}.json"
+
+
+def _read_zip_json(zf: zipfile.ZipFile, name: str) -> dict | None:
+    try:
+        raw = zf.read(name)
+        return json.loads(raw.decode("utf-8", errors="replace"))
+    except Exception:
+        return None
+
+
+def import_mcn_upload(file_name: str, file_bytes: bytes) -> dict:
+    """
+    Import either:
+      - a single game JSON file, or
+      - a ZIP exported from this app (games + optional tactics)
+    Returns a report dict to show in the UI.
+    """
+    report = {
+        "imported_games": [],     # list[Path]
+        "imported_tactics": 0,
+        "warnings": [],
+        "errors": [],
+    }
+
+    if not file_bytes:
+        report["errors"].append("Empty upload.")
+        return report
+
+    name_lower = (file_name or "").lower()
+
+    # ---- ZIP PACKAGE ----
+    if name_lower.endswith(".zip"):
+        try:
+            zf = zipfile.ZipFile(io.BytesIO(file_bytes), "r")
+        except Exception as e:
+            report["errors"].append(f"Could not open zip: {e}")
+            return report
+
+        # Accept both:
+        # - games/*.json (your exporter below)
+        # - loose game_*.json at root (more forgiving)
+        game_members = [
+            n for n in zf.namelist()
+            if n.lower().endswith(".json") and (
+                n.startswith("games/") or Path(n).name.startswith("game_")
+            )
+        ]
+        tactic_members = [
+            n for n in zf.namelist()
+            if n.lower().endswith(".json") and (
+                n.startswith("tactics/") or Path(n).name.startswith("tactic_")
+            )
+        ]
+
+        if not game_members and not tactic_members:
+            report["errors"].append("Zip did not contain any games/ or tactics/ JSON files.")
+            return report
+
+        # 1) Plan new destinations for all games first, so we can rewrite references
+        rel_to_new_abs: dict[str, str] = {}
+        staged_games: list[tuple[str, dict]] = []
+
+        for member in sorted(game_members):
+            payload = _read_zip_json(zf, member)
+            if not payload:
+                report["warnings"].append(f"Could not parse: {member}")
+                continue
+
+            moves = payload.get("moves_san") or []
+            if not isinstance(moves, list) or not moves:
+                report["warnings"].append(f"Skipping (no moves): {member}")
+                continue
+
+            old_source = str(payload.get("source") or "").strip()
+            payload["source"] = _unique_source_name(old_source or Path(member).stem)
+
+            out_path = _unique_game_path(payload.get("timestamp"))
+            new_abs = _resolve_path_str(out_path)
+
+            # Key by the archive-relative name AND also bare filename (for forgiving imports)
+            rel_to_new_abs[member] = new_abs
+            rel_to_new_abs[Path(member).name] = new_abs
+
+            staged_games.append((member, payload))
+
+        # 2) Write games, rewriting comment source_file pointers to new abs paths
+        for member, payload in staged_games:
+            out_path = Path(rel_to_new_abs[member])
+
+            # Rewrite comments
+            fixed_comments: list[dict] = []
+            for c in (payload.get("comments") or []):
+                c = dict(c)
+                origin = c.get("origin") or "original"
+
+                if origin == "original":
+                    # Ensure originals point to *this* imported game file
+                    c["origin"] = "original"
+                    c["source_file"] = _resolve_path_str(out_path)
+                    if not c.get("id"):
+                        c["id"] = str(uuid.uuid4())
+                    if not c.get("source_label"):
+                        c["source_label"] = payload.get("source") or out_path.name
+                    fixed_comments.append(c)
+                    continue
+
+                # Imported comment: try to rewrite source_file if it references a bundled game
+                if origin == "imported":
+                    src = str(c.get("source_file") or "").strip()
+                    if src:
+                        # If exporter wrote "games/<file>.json", map that too
+                        src_norm = src.replace("\\", "/")
+                        src_norm = src_norm[2:] if src_norm.startswith("./") else src_norm
+                        if src_norm.startswith("games/"):
+                            src_norm = src_norm
+                        # Map by exact member, or by basename
+                        new_src = rel_to_new_abs.get(src_norm) or rel_to_new_abs.get(Path(src_norm).name)
+
+                        if new_src:
+                            c["source_file"] = new_src
+                        else:
+                            # Keep but warn: it won’t resolve locally
+                            report["warnings"].append(
+                                f"Imported comment references a source not in this package: {src}"
+                            )
+                    fixed_comments.append(c)
+                    continue
+
+                fixed_comments.append(c)
+
+            payload["comments"] = fixed_comments
+
+            try:
+                out_path.write_text(json.dumps(payload, indent=2))
+                report["imported_games"].append(out_path)
+            except Exception as e:
+                report["errors"].append(f"Failed writing {out_path.name}: {e}")
+
+        # 3) Import tactics (optional), rewriting source_game_file if possible
+        imported_tactics = 0
+        for member in sorted(tactic_members):
+            payload = _read_zip_json(zf, member)
+            if not payload:
+                report["warnings"].append(f"Could not parse: {member}")
+                continue
+
+            src = str(payload.get("source_game_file") or "").strip()
+            if src:
+                src_norm = src.replace("\\", "/")
+                src_norm = src_norm[2:] if src_norm.startswith("./") else src_norm
+                if src_norm.startswith("games/"):
+                    mapped = rel_to_new_abs.get(src_norm) or rel_to_new_abs.get(Path(src_norm).name)
+                else:
+                    mapped = rel_to_new_abs.get(src_norm) or rel_to_new_abs.get(Path(src_norm).name)
+
+                if mapped:
+                    payload["source_game_file"] = mapped
+                else:
+                    report["warnings"].append(f"Tactic references a game not imported: {src}")
+
+            outp = _unique_tactic_path(payload.get("timestamp"))
+            try:
+                outp.write_text(json.dumps(payload, indent=2))
+                imported_tactics += 1
+            except Exception as e:
+                report["errors"].append(f"Failed writing tactic {outp.name}: {e}")
+
+        report["imported_tactics"] = imported_tactics
+        return report
+
+    # ---- SINGLE GAME JSON ----
+    try:
+        payload = json.loads(file_bytes.decode("utf-8", errors="replace"))
+    except Exception as e:
+        report["errors"].append(f"Could not parse JSON: {e}")
+        return report
+
+    moves = payload.get("moves_san") or []
+    if not isinstance(moves, list) or not moves:
+        report["errors"].append("JSON did not look like a saved game (missing moves_san).")
+        return report
+
+    payload["source"] = _unique_source_name(str(payload.get("source") or "").strip() or "Imported game")
+    out_path = _unique_game_path(payload.get("timestamp"))
+
+    # Rewrite originals to point at the new file
+    fixed_comments: list[dict] = []
+    for c in (payload.get("comments") or []):
+        c = dict(c)
+        if (c.get("origin") or "original") == "original":
+            c["origin"] = "original"
+            c["source_file"] = _resolve_path_str(out_path)
+            if not c.get("id"):
+                c["id"] = str(uuid.uuid4())
+            if not c.get("source_label"):
+                c["source_label"] = payload.get("source") or out_path.name
+        fixed_comments.append(c)
+    payload["comments"] = fixed_comments
+
+    try:
+        out_path.write_text(json.dumps(payload, indent=2))
+        report["imported_games"].append(out_path)
+    except Exception as e:
+        report["errors"].append(f"Failed writing {out_path.name}: {e}")
+
+    return report
+
+
+def export_mcn_zip(
+    selected_game_paths: list[Path],
+    include_tactics: bool = True,
+    include_source_games_for_imported_comments: bool = True,
+) -> tuple[bytes, dict]:
+    """
+    Create a ZIP that can be re-imported via import_mcn_upload().
+    ZIP layout:
+      games/<game_file>.json
+      tactics/<tactic_file>.json   (optional)
+      manifest.json
+    We rewrite comment source_file pointers to relative 'games/<file>.json' when possible.
+    """
+    meta = {"warnings": [], "games": 0, "tactics": 0}
+
+    # Build closure of games to include (optional)
+    to_include: dict[str, Path] = {}
+    queue: list[Path] = [Path(p) for p in (selected_game_paths or [])]
+
+    def add_game(p: Path):
+        ap = _resolve_path_str(p)
+        if not ap or ap in to_include:
+            return
+        to_include[ap] = p
+
+    for p in queue:
+        if p.exists():
+            add_game(p)
+
+    if include_source_games_for_imported_comments:
+        # BFS: include games referenced by imported comments
+        added = True
+        while added:
+            added = False
+            current = list(to_include.values())
+            for gp in current:
+                payload = _read_json(gp) or {}
+                for c in (payload.get("comments") or []):
+                    if (c.get("origin") or "") != "imported":
+                        continue
+                    src = str(c.get("source_file") or "").strip()
+                    if not src:
+                        continue
+                    srcp = Path(src)
+                    if srcp.exists() and str(srcp.resolve()) not in to_include:
+                        add_game(srcp)
+                        added = True
+
+    # Map abs->zip relative
+    abs_to_rel: dict[str, str] = {}
+    for ap, p in to_include.items():
+        abs_to_rel[ap] = f"games/{Path(p).name}"
+
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        # Games
+        for ap, p in to_include.items():
+            payload = _read_json(p)
+            if not payload:
+                meta["warnings"].append(f"Unreadable game skipped: {Path(p).name}")
+                continue
+
+            rel = abs_to_rel.get(_resolve_path_str(p))
+            if not rel:
+                continue
+
+            # Rewrite comment pointers
+            rewritten_comments: list[dict] = []
+            for c in (payload.get("comments") or []):
+                c = dict(c)
+                origin = c.get("origin") or "original"
+
+                if origin == "original":
+                    c["source_file"] = rel
+                    rewritten_comments.append(c)
+                    continue
+
+                if origin == "imported":
+                    src = str(c.get("source_file") or "").strip()
+                    src_abs = _resolve_path_str(src)
+                    if src_abs and src_abs in abs_to_rel:
+                        c["source_file"] = abs_to_rel[src_abs]
+                    else:
+                        # Leave as-is (may not resolve after import)
+                        meta["warnings"].append(
+                            f"Imported comment source not included in export: {Path(src).name if src else '(missing)'}"
+                        )
+                    rewritten_comments.append(c)
+                    continue
+
+                rewritten_comments.append(c)
+
+            payload["comments"] = rewritten_comments
+            zf.writestr(rel, json.dumps(payload, indent=2))
+            meta["games"] += 1
+
+        # Tactics (optional)
+        if include_tactics:
+            # include tactics whose source_game_file is among included games
+            included_abs = set(abs_to_rel.keys())
+            for tfp in list_tactics():
+                tp = _read_json(tfp)
+                if not tp:
+                    continue
+                src = _resolve_path_str(tp.get("source_game_file"))
+                if src and src in included_abs:
+                    tp = dict(tp)
+                    tp["source_game_file"] = abs_to_rel[src]
+                    zf.writestr(f"tactics/{Path(tfp).name}", json.dumps(tp, indent=2))
+                    meta["tactics"] += 1
+
+        manifest = {
+            "format": "MyChessNotebookExport",
+            "version": 1,
+            "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "games": meta["games"],
+            "tactics": meta["tactics"],
+        }
+        zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+
+    return buf.getvalue(), meta
 
 
 # ===================== Editability / Mode =====================
@@ -1769,7 +2398,6 @@ def exit_tactic_mode_hard() -> None:
 
     ss.tactic_mode = False
 
-    # Clear loaded tactic + runtime solving state
     ss.tactic_current_file = None
     ss.tactic_payload = None
     ss.tactic_board = chess.Board()
@@ -1779,11 +2407,61 @@ def exit_tactic_mode_hard() -> None:
     ss.tactic_complete = False
     ss.tactic_reveal_next = False
 
-    # Optional: clear note draft/trigger text so nothing leaks conceptually
     ss.tactic_note_draft = ""
     ss.tactic_note_flash = ""
     ss.tactic_trigger_text = ""
     ss.tactic_show_notes = False
+
+def make_load_tactic_from_manage(path_str: str, payload: dict):
+    def _cb():
+        st.session_state.tactic_mode = True
+        _tactic_load_into_state(Path(path_str), payload)
+    return _cb
+
+
+def on_mark_delete_tactic(path_str: str) -> None:
+    st.session_state.tactic_delete_pending = str(path_str)
+
+
+def on_cancel_delete_tactic() -> None:
+    st.session_state.tactic_delete_pending = None
+
+
+def make_delete_tactic_confirm(path_str: str):
+    def _cb():
+        p = Path(path_str)
+        try:
+            # If deleting the currently loaded tactic, clear it first
+            cur = st.session_state.get("tactic_current_file")
+            deleting_current = _paths_equal(cur, path_str)
+
+            if p.exists():
+                p.unlink()
+
+            st.session_state.tactic_delete_pending = None
+            st.session_state.tactic_note_flash = ""
+            st.session_state.tactic_feedback = f"Deleted tactic: {p.name}"
+
+            if deleting_current:
+                st.session_state.tactic_current_file = None
+                st.session_state.tactic_payload = None
+                _tactic_reset_runtime()
+
+                # Optional: auto-load the next tactic (respects your existing filter)
+                fp, payload = load_random_tactic(
+                    selected_tags=st.session_state.get("tactic_filter_tags", []),
+                    match_all=bool(st.session_state.get("tactic_filter_match_all", False)),
+                )
+                if payload:
+                    _tactic_load_into_state(fp, payload)
+                else:
+                    st.session_state.tactic_feedback = "Deleted. No remaining tactics match your filter."
+
+        except Exception as e:
+            st.session_state.tactic_delete_pending = None
+            st.session_state.tactic_feedback = f"Could not delete tactic: {e}"
+    return _cb
+
 
 
 
@@ -2520,6 +3198,17 @@ def on_clear_search() -> None:
 
 files = sorted(DATA_DIR.glob("game_*.json"), reverse=True)
 
+
+def _run_pending_actions() -> None:
+    ss = st.session_state
+    if ss.get("pgn_pending_import", False):
+        ss.pgn_pending_import = False
+        # Runs at the top of a rerun, before widgets instantiate
+        on_import_selected_pgn(do_rerun=False)
+        st.rerun()
+
+_run_pending_actions()
+
 with st.sidebar:
     st.header("Actions")
 
@@ -2694,7 +3383,8 @@ def render_tactic_right_panel() -> None:
     st.subheader("Tactic panel")
 
     # Tabs: Notes removed (now lives in Info)
-    tab_info, tab_filter = st.tabs(["Info", "Filter"])
+    tab_info, tab_filter, tab_manage = st.tabs(["Info", "Filter", "All tactics"])
+
 
     payload = st.session_state.get("tactic_payload") or None
 
@@ -2756,6 +3446,118 @@ def render_tactic_right_panel() -> None:
                     unsafe_allow_html=True,
                 )
 
+        with tab_manage:
+            # Build catalog (already cached by mtimes)
+            file_mtimes = _tactic_file_mtimes()
+            catalog = build_tactics_catalog_cached(file_mtimes)
+
+            total = len(catalog)
+            if total == 0:
+                st.caption("_No tactics saved yet._")
+                return
+
+            # Controls
+            st.text_input(
+                "Search tactics",
+                key="tactic_manage_query",
+                placeholder="Search by source, trigger, tag…",
+                label_visibility="collapsed",
+            ) 
+
+            # Reuse existing tag filter (same as training Filter tab)
+            selected = st.session_state.get("tactic_filter_tags", [])
+            match_all = bool(st.session_state.get("tactic_filter_match_all", False))
+
+            q = (st.session_state.get("tactic_manage_query") or "").strip().lower()
+            lim = int(st.session_state.get("tactic_manage_limit", 50) or 50)
+
+            def _matches(it: dict) -> bool:
+                payload = it.get("payload") or {}
+                tags = it.get("tags") or []
+                if selected and not _tactic_matches_selected_tags(tags, selected, match_all):
+                    return False
+
+                if not q:
+                    return True
+
+                label = str(payload.get("source_label") or "")
+                trig = _tactic_trigger_text(payload) or ""
+                name = Path(it.get("path") or "").name
+                hay = " ".join([label, trig, name, " ".join(tags)]).lower()
+                return q in hay
+
+            filtered = [it for it in catalog if _matches(it)]
+
+            st.caption(f"Showing: **{min(len(filtered), lim)}** / {len(filtered)} matched (total tactics: {total})")
+
+            pending = st.session_state.get("tactic_delete_pending")
+
+            for it in filtered[:lim]:
+                path_str = str(it.get("path") or "")
+                payload = it.get("payload") or {}
+                tags = it.get("tags") or []
+
+                src_label = (payload.get("source_label") or "").strip() or "(untitled)"
+                start_ply = _safe_int(payload.get("start_ply", 0), 0)
+                start_move_num = (start_ply // 2) + 1
+                trigger = _tactic_trigger_text(payload)
+
+                # Compact row
+                st.markdown("<div class='comment-card'>", unsafe_allow_html=True)
+                title = f"**{src_label}**  <span class='small-muted'>· starts move {start_move_num}</span>"
+                st.markdown(title, unsafe_allow_html=True)
+
+                meta_bits = []
+                if trigger:
+                    meta_bits.append(f"after {trigger}")
+                if tags:
+                    meta_bits.append(f"{len(tags)} tag(s)")
+                if meta_bits:
+                    st.caption(" · ".join(meta_bits))
+
+                c1, c2, c3 = st.columns([0.34, 0.33, 0.33])
+                with c1:
+                    st.button(
+                        "Load / Train",
+                        key=f"tman_load_{Path(path_str).name}",
+                        use_container_width=True,
+                        on_click=make_load_tactic_from_manage(path_str, payload),
+                    )
+                with c2:
+                    st.button(
+                        "Go to game",
+                        key=f"tman_goto_{Path(path_str).name}",
+                        use_container_width=True,
+                        on_click=on_go_to_tactic_game,
+                        disabled=not _paths_equal(st.session_state.get("tactic_current_file"), path_str),
+                        help="Enabled only for the currently loaded tactic.",
+                    )
+                with c3:
+                    if pending == path_str:
+                        d1, d2 = st.columns(2)
+                        with d1:
+                            st.button(
+                                "Confirm",
+                                key=f"tman_del_yes_{Path(path_str).name}",
+                                use_container_width=True,
+                                on_click=make_delete_tactic_confirm(path_str),
+                            )
+                        with d2:
+                            st.button(
+                                "Cancel",
+                                key=f"tman_del_no_{Path(path_str).name}",
+                                use_container_width=True,
+                                on_click=on_cancel_delete_tactic,
+                            )
+                    else:
+                        st.button(
+                            "Delete",
+                            key=f"tman_del_{Path(path_str).name}",
+                            use_container_width=True,
+                            on_click=lambda p=path_str: on_mark_delete_tactic(p),
+                        )
+
+                st.markdown("</div>", unsafe_allow_html=True)
 
 
     with tab_filter:
@@ -2955,15 +3757,34 @@ with top_right:
         # (Optional) show nothing at all:
         render_tactic_right_panel()
     else:
-        tab_labels = ["Moves & Comments", "Game Info & Save", "Similar Games / Delete", "Coverage Map"]
+        # Pick label based on whether we’re in New Game mode
+        SIMILAR_TAB_LABEL = "Matching Games" if (st.session_state.get("current_file") is None) else "Similar Games / Delete"
+
+        tab_labels = ["Moves & Comments", "Game Info & Save", SIMILAR_TAB_LABEL, "Coverage Map"]
+
+        # Only show Import/Export when you're in a New Game (unsaved) state
+        if st.session_state.get("current_file") is None:
+            tab_labels.append("Import / Export")
 
         show_tactics_tab = bool(st.session_state.get("current_file")) and (not moves_dirty_vs_loaded())
         if show_tactics_tab:
             tab_labels.append("Tactics")
 
         tabs = st.tabs(tab_labels)
-        tab_moves, tab_meta, tab_similar, tab_coverage = tabs[:4]
-        tab_tactics = tabs[4] if show_tactics_tab else None
+
+        # Map labels to tabs so optional sections don't shift indices
+        tab_map = {name: tab for name, tab in zip(tab_labels, tabs)}
+
+        tab_moves = tab_map["Moves & Comments"]
+        tab_meta = tab_map["Game Info & Save"]
+        tab_similar = tab_map[SIMILAR_TAB_LABEL]   # <-- use the variable here
+        tab_coverage = tab_map["Coverage Map"]
+
+        tab_import_export = tab_map.get("Import / Export")
+        tab_tactics = tab_map.get("Tactics")
+
+
+
 
         # ===== Tab 1: Moves & Comments =====
         with tab_moves:
@@ -3320,9 +4141,12 @@ with top_right:
                                 else:
                                     next_text = "_(Line ends here)_"
 
+                                rem_plies = int(m.get("remaining_plies", 0) or 0)
+                                rem_moves = rem_plies // 2  # round down
+
                                 st.markdown(
                                     f"**{m['label']}**  \n"
-                                    f"<span class='small-muted'>{next_text} · remaining plies: {m['remaining_plies']}</span>",
+                                    f"<span class='small-muted'>{next_text} · remaining moves: {rem_moves}</span>",
                                     unsafe_allow_html=True,
                                 )
 
@@ -3378,7 +4202,6 @@ with top_right:
                                 key="confirm_delete_current",
                                 use_container_width=True,
                                 on_click=make_delete_confirm(cur_path),
-                                disabled=is_read_only(),
                             )
                         with c2:
                             st.button(
@@ -3393,7 +4216,6 @@ with top_right:
                             key="mark_delete_current",
                             use_container_width=True,
                             on_click=on_mark_delete_current,
-                            disabled=is_read_only(),
                         )
 
                     st.markdown("</div>", unsafe_allow_html=True)
@@ -3586,3 +4408,173 @@ with top_right:
                             )
                         with c2:
                             st.markdown(f"**{label}**{span}")
+
+        if tab_import_export is not None:
+            with tab_import_export:
+                st.subheader("Import / Export")
+
+                # ---------- 1) PGN Import ----------
+                st.markdown("### 1) Import PGN (chess.com / lichess)")
+                st.caption("Imports the mainline from a single PGN game into your current (unsaved) workspace.")
+
+                pgn_file = st.file_uploader(
+                    "PGN file",
+                    type=["pgn"],
+                    accept_multiple_files=False,
+                    key=f"pgn_upload_main_{st.session_state.pgn_uploader_nonce}",
+                    label_visibility="collapsed",
+                )
+
+                if pgn_file is not None:
+                    b = pgn_file.getvalue()
+                    fp = _pgn_fingerprint(pgn_file.name, b)
+
+                    if st.session_state.get("pgn_fingerprint") != fp:
+                        games, errs = parse_pgn_upload(b)
+                        st.session_state.pgn_fingerprint = fp
+                        st.session_state.pgn_games = games
+                        st.session_state.pgn_parse_errors = errs
+
+                        if games and not errs:
+                            st.session_state.pgn_selected_idx = 0
+                            if st.session_state.get("pgn_auto_import_single", True) and len(games) == 1:
+                                st.session_state.pgn_pending_import = True
+                                st.rerun()
+
+                    errs = st.session_state.get("pgn_parse_errors") or []
+                    if errs:
+                        for e in errs[:6]:
+                            st.caption(f"⚠️ {e}")
+                    else:
+                        games = st.session_state.get("pgn_games") or []
+                        if games:
+                            g = games[0]
+                            st.caption(f"✅ Detected: {g['label']} · {len(g['moves_san'])} plies")
+                
+
+                st.markdown("### Or paste PGN / movetext")
+                st.caption("Paste a full PGN (with headers) or just a move line like: `1. d4 d5 2. Bf4 ...`")
+
+                st.text_area(
+                    "Paste PGN",
+                    key="pgn_paste_text",
+                    height=160,
+                    placeholder="Paste PGN here…",
+                    label_visibility="collapsed",
+                )
+
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.button("Parse pasted PGN", on_click=on_parse_pgn_paste, use_container_width=True)
+                with c2:
+                    st.button("Clear", on_click=reset_pgn_import_ui, use_container_width=True)
+
+                # If we have parsed games (from file OR paste), let user choose + import
+                games = st.session_state.get("pgn_games") or []
+                errs = st.session_state.get("pgn_parse_errors") or []
+
+                if errs:
+                    for e in errs[:6]:
+                        st.caption(f"⚠️ {e}")
+
+                if games:
+                    if len(games) > 1:
+                        st.selectbox(
+                            "Choose game",
+                            options=list(range(len(games))),
+                            format_func=lambda i: games[i]["label"],
+                            key="pgn_selected_idx",
+                        )
+                        st.caption(f"Parsed **{len(games)}** game(s). Select one to import.")
+                    else:
+                        st.caption(f"✅ Ready: {games[0]['label']} · {len(games[0]['moves_san'])} plies")
+
+                    st.button(
+                        "Import selected game",
+                        type="primary",
+                        on_click=on_mark_pgn_pending_import,
+                        use_container_width=True,
+                        disabled=bool(errs),
+                    )
+
+
+                st.divider()
+
+                # ---------- 2) Import MyChessNotebook package ----------
+                st.markdown("### 2) Import MyChessNotebook package")
+                st.caption("Upload a single exported game JSON, or a ZIP package containing multiple games (and optional tactics).")
+
+                mcn_file = st.file_uploader(
+                    "MyChessNotebook export (.json or .zip)",
+                    type=["json", "zip"],
+                    accept_multiple_files=False,
+                    key="mcn_import_uploader",
+                    label_visibility="collapsed",
+                )
+
+                if mcn_file is not None:
+                    report = import_mcn_upload(mcn_file.name, mcn_file.getvalue())
+
+                    if report["errors"]:
+                        for e in report["errors"][:8]:
+                            st.markdown(f"<div class='flash'>❌ {e}</div>", unsafe_allow_html=True)
+
+                    if report["warnings"]:
+                        with st.expander(f"Warnings ({len(report['warnings'])})"):
+                            for w in report["warnings"][:50]:
+                                st.caption(f"⚠️ {w}")
+
+                    if report["imported_games"]:
+                        st.markdown(
+                            f"<div class='soft-panel'><b>Imported games:</b> {len(report['imported_games'])}<br>"
+                            f"<span class='small-muted'>Saved into your local database.</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                        if report["imported_tactics"]:
+                            st.caption(f"Imported tactics: **{report['imported_tactics']}**")
+
+                st.divider()
+
+                # ---------- 3) Export ----------
+                st.markdown("### 3) Export")
+                st.caption("Select games to export. The ZIP will include those games (and optionally tactics).")
+
+                games_index = build_games_index_cached(_game_file_mtimes())
+                # label -> path
+                label_to_path = {g["label"]: g["path"] for g in games_index}
+
+                selected_labels = st.multiselect(
+                    "Games to export",
+                    options=list(label_to_path.keys()),
+                )
+
+                include_tactics = st.checkbox("Include tactics for selected games", value=True)
+                include_sources = st.checkbox(
+                    "Include source games needed for imported comments",
+                    value=True,
+                    help="If selected games have imported comments pointing to other games, include those source games too.",
+                )
+
+                if selected_labels:
+                    selected_paths = [label_to_path[lbl] for lbl in selected_labels if lbl in label_to_path]
+                    zip_bytes, meta = export_mcn_zip(
+                        selected_game_paths=selected_paths,
+                        include_tactics=include_tactics,
+                        include_source_games_for_imported_comments=include_sources,
+                    )
+
+                    st.caption(f"Will export: **{meta['games']}** game(s), **{meta['tactics']}** tactic(s)")
+                    if meta["warnings"]:
+                        with st.expander(f"Export warnings ({len(meta['warnings'])})"):
+                            for w in meta["warnings"][:50]:
+                                st.caption(f"⚠️ {w}")
+
+                    st.download_button(
+                        "Download export ZIP",
+                        data=zip_bytes,
+                        file_name=f"MyChessNotebook_export_{time.strftime('%Y%m%d_%H%M%S')}.zip",
+                        mime="application/zip",
+                        use_container_width=True,
+                    )
+                else:
+                    st.caption("_Select at least one game to enable export._")
