@@ -36,15 +36,6 @@ Data & Files
 - Saved tactics: `data/tactics/tactic_<timestamp>_<id>.json`.
 - Directories are created on first run; files are plain JSON for easy backup or sync.
 
-Typical Workflow
-----------------
-- New line: enter moves (suggestions appear when a prefix exists), add comments, and save.
-- Open saved line: loads in Explore mode (moves locked, comments editable in their source game); switch to Edit to change moves and overwrite.
-- Template: “Use as Template” clones the move list as a new unsaved line with comments imported from the original.
-- Walkthrough: step through a line with comments hidden until revealed under the board.
-- Tactics: in a saved game, pick a start (after a Black move) and end (after a White move) window, add notes, and save. Train via “Tactic mode” with optional tag filters.
-- Coverage: adjust the move-depth slider to see how many saved lines reach each node in the repertoire tree.
-
 Tips
 ----------------
 - Move input accepts O-O, 0-0, o-o (and queenside variants) plus lenient capture/check notation.
