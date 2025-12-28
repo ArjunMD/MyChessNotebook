@@ -178,6 +178,8 @@ def _init_state() -> None:
         "tactic_manage_query": "",       
         "tactic_manage_limit": 50,       
         "pgn_paste_text": "",
+        "tactic_note_editor": "",
+        "tactic_note_editor_for": "", 
   
     }
 
@@ -3175,7 +3177,7 @@ def on_save_tactic_note() -> None:
         st.session_state.tactic_note_flash = "Couldn't read tactic file."
         return
 
-    payload["note"] = str(st.session_state.get("tactic_note_draft") or "").rstrip()
+    payload["note"] = str(st.session_state.get("tactic_note_editor") or "").rstrip()
     if _write_json(p, payload):
         st.session_state.tactic_payload = payload
         st.session_state.tactic_note_flash = "Saved tactic notes."
@@ -3185,7 +3187,7 @@ def on_save_tactic_note() -> None:
 
 def on_revert_tactic_note() -> None:
     payload = st.session_state.get("tactic_payload") or {}
-    st.session_state.tactic_note_draft = str(payload.get("note", "") or "")
+    st.session_state.tactic_note_editor = str(payload.get("note", "") or "")
     st.session_state.tactic_note_flash = "Reverted."
 
 
@@ -3521,10 +3523,23 @@ def render_tactic_right_panel() -> None:
             st.code(format_tactic_solution(payload))
 
         st.checkbox("Show notes", key="tactic_show_notes")
+
         if st.session_state.get("tactic_show_notes", False):
+            cur_tactic = st.session_state.get("tactic_current_file") or ""
+            saved_note = str((payload or {}).get("note", "") or "")
+            
+
+            # Seed editor when switching tactics OR if Streamlit wiped the widget while hidden
+            if (
+                st.session_state.get("tactic_note_editor_for") != cur_tactic
+                or not (st.session_state.get("tactic_note_editor") or "").strip()
+            ):
+                st.session_state.tactic_note_editor_for = cur_tactic
+                st.session_state.tactic_note_editor = saved_note
+
             st.text_area(
                 "Notes",
-                key="tactic_note_draft",
+                key="tactic_note_editor",
                 height=160,
                 placeholder="Themes, key squares, why it works, common mistakes, etc.",
                 label_visibility="collapsed",
@@ -3535,6 +3550,7 @@ def render_tactic_right_panel() -> None:
                 st.button("Save notes", on_click=on_save_tactic_note, use_container_width=True)
             with n2:
                 st.button("Revert", on_click=on_revert_tactic_note, use_container_width=True)
+
 
             if st.session_state.get("tactic_note_flash"):
                 st.markdown(
