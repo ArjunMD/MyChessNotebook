@@ -180,6 +180,10 @@ def _init_state() -> None:
         "pgn_paste_text": "",
         "tactic_note_editor": "",
         "tactic_note_editor_for": "", 
+        "collision_catalog": [],          
+        "collision_idx": 0,               
+        "collision_expanded": False,       
+
   
     }
 
@@ -1753,6 +1757,68 @@ def _propagate_comment_edit_to_imports(source_file: str, source_comment_id: str,
         if changed:
             _write_json(fp, payload)
 
+def _propagate_comment_delete_to_imports(
+    source_file: str,
+    source_comment_id: str | None,
+    old_text: str,
+    old_start: int,
+) -> tuple[int, int]:
+    """
+    Remove imported copies of a source comment across all saved games.
+    Matches by (source_file + source_comment_id) when available.
+    Falls back to (source_file + start + text) for legacy cases.
+    Returns (files_touched, comments_removed).
+    """
+    sf_abs = _resolve_path_str(source_file)
+    if not sf_abs:
+        return (0, 0)
+
+    files_touched = 0
+    removed = 0
+
+    for fp in sorted(DATA_DIR.glob("game_*.json")):
+        if _paths_equal(fp, sf_abs):
+            continue  # don't touch the source game here
+
+        payload = _read_json(fp)
+        if not payload:
+            continue
+
+        before = payload.get("comments", []) or []
+        after: list[dict] = []
+
+        removed_here = 0
+        for c in before:
+            if c.get("origin") != "imported":
+                after.append(c)
+                continue
+
+            if not _paths_equal(c.get("source_file", ""), sf_abs):
+                after.append(c)
+                continue
+
+            # Prefer id match
+            if source_comment_id and c.get("source_comment_id") == source_comment_id:
+                removed_here += 1
+                continue
+
+            # Legacy fallback: no ids, match by (start,text)
+            if (not source_comment_id) and (c.get("source_comment_id") in (None, "")):
+                if _safe_int(c.get("start", -999), -999) == int(old_start) and str(c.get("text", "")).strip() == str(old_text).strip():
+                    removed_here += 1
+                    continue
+
+            after.append(c)
+
+        if removed_here:
+            payload["comments"] = after
+            if _write_json(fp, payload):
+                files_touched += 1
+                removed += removed_here
+
+    return files_touched, removed
+
+
 
 # ===================== Sync Imported Comments (All Games) =====================
 def _sync_all_imported_comments() -> tuple[int, int]:
@@ -2793,21 +2859,51 @@ def on_add_comment() -> None:
 
 def make_delete_comment(idx: int):
     def _cb():
-        if 0 <= idx < len(st.session_state.comments):
-            c = st.session_state.comments[idx]
-            if not _is_comment_deletable_here(c):
-                st.session_state.flash = "This comment isn’t deletable here."
-                return
+        if not (0 <= idx < len(st.session_state.comments)):
+            return
 
-            del st.session_state.comments[idx]
+        c = st.session_state.comments[idx]
+        if not _is_comment_deletable_here(c):
+            st.session_state.flash = "This comment isn’t deletable here."
+            return
 
-            edit_idx = st.session_state.get("edit_comment_idx")
-            if edit_idx is not None:
-                if idx == edit_idx:
-                    st.session_state.edit_comment_idx = None
-                    st.session_state.new_comment_text = ""
-                elif idx < edit_idx:
-                    st.session_state.edit_comment_idx = edit_idx - 1
+        # Capture info BEFORE deletion (needed for propagation)
+        old_id = str(c.get("id") or "") or None
+        old_src = _resolve_path_str(c.get("source_file"))
+        old_text = str(c.get("text", "")).strip()
+        old_start = _safe_int(c.get("start", 0), 0)
+
+        del st.session_state.comments[idx]
+
+        # Fix edit pointer bookkeeping (your original logic)
+        edit_idx = st.session_state.get("edit_comment_idx")
+        if edit_idx is not None:
+            if idx == edit_idx:
+                st.session_state.edit_comment_idx = None
+                st.session_state.new_comment_text = ""
+            elif idx < edit_idx:
+                st.session_state.edit_comment_idx = edit_idx - 1
+
+        # Persist deletion to disk if we're in a saved game
+        cur_file = st.session_state.get("current_file")
+        if cur_file:
+            on_save_comments_to_current()
+
+            # Propagate deletion to imported copies elsewhere
+            try:
+                if old_src:
+                    files_touched, removed = _propagate_comment_delete_to_imports(
+                        source_file=old_src,
+                        source_comment_id=old_id,
+                        old_text=old_text,
+                        old_start=old_start,
+                    )
+                    # Optional: update flash message (or omit if you prefer silence)
+                    if removed:
+                        st.session_state.flash = f"Deleted comment. Removed {removed} imported copy/copies in {files_touched} game(s)."
+            except Exception:
+                pass
+
     return _cb
 
 
@@ -2885,17 +2981,202 @@ def make_reveal_comment(idx: int):
             st.session_state.walkthrough_revealed = revealed
     return _cb
 
+def _game_label_and_ts(fp: Path) -> tuple[str, str]:
+    payload = _read_json(fp) or {}
+    label = (payload.get("source") or "").strip() or fp.name
+    ts = str(payload.get("timestamp") or fp.stem.replace("game_", ""))
+    return label, ts
+
+
+def build_collision_catalog_all_games() -> list[dict]:
+    """
+    Build a list of "collision events" across ALL saved games.
+
+    Collision definition (import-risk focused):
+      For a given destination game + ply index, there are >=2 comments at that ply
+      AND they come from >=2 distinct source games (destination counts as one source
+      for originals; imported comments count by their source_file).
+
+    Returns list of events sorted newest-first by destination timestamp, then by ply.
+    Each event:
+      {
+        "dest_file": str, "dest_label": str, "dest_ts": str,
+        "start_ply": int, "move_label": str,
+        "original_count": int,
+        "sources": [
+           {"source_file": str, "source_label": str, "n_comments": int, "comment_ids": [str,...]}
+        ]
+      }
+    """
+    events: list[dict] = []
+
+    for fp in sorted(DATA_DIR.glob("game_*.json"), reverse=True):
+        payload = _read_json(fp) or {}
+        moves = payload.get("moves_san") or []
+        comments = payload.get("comments") or []
+        if not moves or not comments:
+            continue
+
+        dest_abs = _resolve_path_str(fp)
+        dest_label, dest_ts = _game_label_and_ts(fp)
+
+        by_ply: dict[int, list[dict]] = defaultdict(list)
+        for c in comments:
+            s = _safe_int(c.get("start", -1), -1)
+            if s >= 0:
+                by_ply[s].append(c)
+
+        for start_ply, lst in by_ply.items():
+            if len(lst) < 2:
+                continue
+
+            # Distinct sources: destination for originals; source_file for imported.
+            src_set: set[str] = set()
+            src_map: dict[str, list[dict]] = defaultdict(list)
+
+            original_count = 0
+
+            for c in lst:
+                if c.get("origin") == "imported" and c.get("source_file"):
+                    sf = _resolve_path_str(c.get("source_file"))
+                    if sf:
+                        src_set.add(sf)
+                        src_map[sf].append(c)
+                else:
+                    # original (or imported missing source_file) -> counts as destination source
+                    original_count += 1
+                    src_set.add(dest_abs)
+
+            if len(src_set) < 2:
+                # e.g., two originals at same ply -> allowed, not a “collision”
+                continue
+
+            # External sources list (exclude destination itself)
+            sources = []
+            for sf, cs in src_map.items():
+                sl = (cs[0].get("source_label") or Path(sf).name) if sf else "Unknown Source"
+                sources.append(
+                    {
+                        "source_file": sf,
+                        "source_label": str(sl),
+                        "n_comments": len(cs),
+                        "comment_ids": [str(x.get("source_comment_id") or "") for x in cs],
+                    }
+                )
+
+            sources.sort(key=lambda d: (-int(d["n_comments"]), d["source_label"]))
+
+            # Human label for that ply in destination game
+            sp = max(0, min(int(start_ply), len(moves) - 1))
+            try:
+                mv_label = ply_label(sp, moves)
+            except Exception:
+                mv_label = f"ply {sp + 1}"
+
+            events.append(
+                {
+                    "dest_file": dest_abs,
+                    "dest_label": dest_label,
+                    "dest_ts": dest_ts,
+                    "start_ply": int(sp),
+                    "move_label": mv_label,
+                    "original_count": int(original_count),
+                    "sources": sources,
+                }
+            )
+
+    # Newest destination games first, then earlier ply within that game
+    events.sort(key=lambda e: (e.get("dest_ts", ""), -e.get("start_ply", 0)), reverse=True)
+    return events
+
+
+def _find_original_comment_start_in_file(source_file: str, comment_id: str) -> int | None:
+    if not source_file or not comment_id:
+        return None
+    payload = _read_json(Path(source_file)) or {}
+    for c in (payload.get("comments") or []):
+        if c.get("origin") == "original" and str(c.get("id") or "") == str(comment_id):
+            return _safe_int(c.get("start", 0), 0)
+    return None
+
+
+def on_open_current_collision() -> None:
+    ss = st.session_state
+    cat = ss.get("collision_catalog") or []
+    if not cat:
+        return
+
+    idx = _safe_int(ss.get("collision_idx", 0), 0)
+    idx = max(0, min(idx, len(cat) - 1))
+    ev = cat[idx]
+
+    ss.collision_expanded = True
+
+    dest = ev.get("dest_file") or ""
+    p = Path(dest)
+    if not p.exists():
+        ss.flash = f"Collision destination file missing: {dest}"
+        return
+
+    load_game_from_path(p)
+
+    # Jump so comments at start_ply are visible (visible when current_ply_idx > start_ply)
+    sp = _safe_int(ev.get("start_ply", 0), 0)
+    target = max(0, min(sp + 1, len(ss.get("moves_san", []))))
+    _reposition_board(target)
+
+
+def on_next_collision() -> None:
+    ss = st.session_state
+    cat = ss.get("collision_catalog") or []
+    if not cat:
+        return
+    ss.collision_idx = (int(ss.get("collision_idx", 0)) + 1) % len(cat)
+    ss.collision_expanded = False
+
+
+def make_open_source_from_collision(source_file: str, comment_ids: list[str], fallback_ply: int):
+    def _cb():
+        ss = st.session_state
+        p = Path(source_file)
+        if not p.exists():
+            ss.flash = f"Source game missing: {source_file}"
+            return
+
+        # Try to jump to the original comment’s own ply; fallback to destination ply
+        start = None
+        for cid in (comment_ids or []):
+            if cid:
+                found = _find_original_comment_start_in_file(source_file, cid)
+                if found is not None:
+                    start = found
+                    break
+
+        load_game_from_path(p)
+        tgt = max(0, min((start if start is not None else fallback_ply) + 1, len(ss.get("moves_san", []))))
+        _reposition_board(tgt)
+    return _cb
+
 
 # ===================== Callbacks: Persist Current Game =====================
 def on_update_all_games() -> None:
     try:
         files_touched, comments_synced = _sync_all_imported_comments()
+
+        # --- compute collisions ONCE, here ---
+        catalog = build_collision_catalog_all_games()
+        st.session_state.collision_catalog = catalog
+        st.session_state.collision_idx = 0
+        st.session_state.collision_expanded = False
+
         st.session_state.flash = (
             f"Updated imported comments in {files_touched} games "
-            f"({comments_synced} comments synchronized)."
+            f"({comments_synced} comments synchronized). "
+            f"Collisions found: {len(catalog)}."
         )
     except Exception as e:
         st.session_state.flash = f"Update-all failed: {e}"
+
 
 
 def on_save_comments_to_current() -> None:
@@ -3312,6 +3593,58 @@ with st.sidebar:
 
     st.button("➕ New game / Reset", use_container_width=True, on_click=on_clear)
     st.button("🔄 Update all games", use_container_width=True, on_click=on_update_all_games)
+
+    # ===================== Collision (computed only on Update) =====================
+    cat = st.session_state.get("collision_catalog") or []
+    if cat:
+        idx = _safe_int(st.session_state.get("collision_idx", 0), 0)
+        idx = max(0, min(idx, len(cat) - 1))
+        ev = cat[idx]
+
+        st.divider()
+        st.markdown("**⚠️ Comment collision**")
+        st.caption(f"{idx + 1} / {len(cat)} · **{ev.get('dest_label')}** · at **{ev.get('move_label')}**")
+
+        c1, c2 = st.columns(2)
+        with c1:
+            st.button(
+                "Go to it",
+                use_container_width=True,
+                on_click=on_open_current_collision,
+            )
+        with c2:
+            st.button(
+                "Next",
+                use_container_width=True,
+                on_click=on_next_collision,
+            )
+
+        if st.session_state.get("collision_expanded", False):
+            with st.expander("Sources", expanded=True):
+                sp = _safe_int(ev.get("start_ply", 0), 0)
+
+                orig_n = int(ev.get("original_count") or 0)
+                if orig_n:
+                    st.caption(f"Also has **{orig_n}** original comment(s) in the destination game at this ply.")
+
+                sources = ev.get("sources") or []
+                if not sources:
+                    st.caption("_Collision is destination+original only (no external imported sources listed)._")
+                else:
+                    for i, it in enumerate(sources):
+                        label = it.get("source_label") or Path(it.get("source_file", "")).name
+                        n = int(it.get("n_comments") or 0)
+                        st.button(
+                            f"{label}  ·  {n} comment(s)",
+                            use_container_width=True,
+                            on_click=make_open_source_from_collision(
+                                it.get("source_file", ""),
+                                it.get("comment_ids") or [],
+                                fallback_ply=sp,
+                            ),
+                            key=f"col_src_{idx}_{i}_{Path(it.get('source_file','')).name}",
+                        )
+
 
     # Search
     q_move = st.text_input(
