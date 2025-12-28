@@ -1515,117 +1515,213 @@ def find_games_with_move(target_san: str, side: str = "white") -> List[Path]:
             hits.append(fp)
     return hits
 
+# ===================== Comment Transposition Index =====================
+def _fen4_key(board: chess.Board) -> str:
+    """
+    Position identity (transposition key) using first 4 FEN fields:
+      piece placement, side to move, castling rights, en passant square
+    This is the right level for "same position" for move-legality and meaning.
+    """
+    return " ".join(board.fen().split(" ")[:4])
+
+
+def _build_comment_transposition_index_raw() -> dict[tuple[str, str], list[dict]]:
+    """
+    Index ORIGINAL comments across all saved games by:
+        (fen4_before_move, move_uci)
+
+    Value: list of {text, source_file, source_label, source_comment_id}
+    """
+    idx: dict[tuple[str, str], list[dict]] = defaultdict(list)
+
+    for fp in sorted(DATA_DIR.glob("game_*.json")):
+        payload = _read_json(fp) or {}
+        moves: list[str] = payload.get("moves_san") or []
+        comments: list[dict] = payload.get("comments") or []
+        if not moves or not comments:
+            continue
+
+        # Group ORIGINAL comments by ply index in that source game
+        by_ply: dict[int, list[dict]] = defaultdict(list)
+        for c in comments:
+            if c.get("origin") == "original":
+                by_ply[_safe_int(c.get("start", -1), -1)].append(c)
+
+        src_abs = _resolve_path_str(fp)
+        src_label = (payload.get("source") or "").strip() or fp.name
+
+        b = chess.Board()
+        for ply, san in enumerate(moves):
+            # key is based on position BEFORE this ply's move
+            pos_key = _fen4_key(b)
+
+            mv, _opts = parse_san_lenient(b, san)
+            if mv is None:
+                # corrupt / unparsable move list in file; stop indexing this file
+                break
+
+            key = (pos_key, mv.uci())
+
+            # attach any original comments that belong to THIS ply
+            for c in by_ply.get(ply, []):
+                text = str(c.get("text", "")).strip()
+                if not text:
+                    continue
+                idx[key].append(
+                    {
+                        "text": text,
+                        "source_file": src_abs,
+                        "source_label": src_label,
+                        "source_comment_id": c.get("id"),  # may be None in legacy files
+                    }
+                )
+
+            b.push(mv)
+
+    return dict(idx)
+
+
+@st.cache_data
+def build_comment_transposition_index_cached(file_mtimes: Tuple[int, ...]) -> dict[tuple[str, str], list[dict]]:
+    """Cached wrapper. file_mtimes is only used as a cache key."""
+    return _build_comment_transposition_index_raw()
+
 
 # ===================== Comment Import =====================
 def import_comments_for_ply(ply: int) -> None:
     """
-    Import any comments from saved games that match the *entire current line*
-    (i.e., same move list) and have a comment attached at `ply`.
+    Import comments for a ply using transposition matching:
+      same position BEFORE the move + same move (UCI).
     """
     if ply < 0:
         return
 
-    cur_moves = st.session_state.moves_san
-    cur_len = len(cur_moves)
-    if cur_len == 0 or ply >= cur_len:
+    moves = st.session_state.get("moves_san", [])
+    if not moves or ply >= len(moves):
         return
 
-    existing = {(c.get("start"), c.get("text")) for c in st.session_state.comments}
+    # Build / fetch cached index of all ORIGINAL comments by (pos_before, move)
+    idx = build_comment_transposition_index_cached(_game_file_mtimes())
 
-    for fp in sorted(DATA_DIR.glob("game_*.json")):
-        payload = _read_json(fp)
-        if not payload:
+    # Dedup: avoid importing the same source comment twice at the same ply
+    def _sig(c: dict) -> tuple:
+        s = _safe_int(c.get("start", -1), -1)
+        sf = _resolve_path_str(c.get("source_file"))
+        cid = str(c.get("source_comment_id") or "")
+        txt = str(c.get("text", "")).strip()
+        # If no stable id, fall back to text to reduce dup spam
+        return (s, sf, cid if cid else txt)
+
+    existing = set(_sig(c) for c in st.session_state.get("comments", []) if c.get("origin") == "imported")
+
+    cur_abs = _resolve_path_str(st.session_state.get("current_file"))
+
+    # Reconstruct board to position BEFORE ply
+    b = chess.Board()
+    for i in range(ply):
+        mv, _opts = parse_san_lenient(b, moves[i])
+        if mv is None:
+            return
+        b.push(mv)
+
+    # Compute key for (pos_before_move, move)
+    pos_key = _fen4_key(b)
+    mv, _opts = parse_san_lenient(b, moves[ply])
+    if mv is None:
+        return
+
+    key = (pos_key, mv.uci())
+    hits = idx.get(key, [])
+    if not hits:
+        return
+
+    for item in hits:
+        src_file = _resolve_path_str(item.get("source_file"))
+        if cur_abs and _paths_equal(src_file, cur_abs):
+            # don't import your own originals back into yourself
             continue
 
-        saved_moves: List[str] = payload.get("moves_san", []) or []
-        if len(saved_moves) <= ply:
-            continue
-        if saved_moves[:cur_len] != cur_moves:
+        text = str(item.get("text", "")).strip()
+        if not text:
             continue
 
-        for c in payload.get("comments", []) or []:
-            s = _safe_int(c.get("start", -1), -1)
-            text = str(c.get("text", "")).strip()
-            if s == ply and text:
-                key = (s, text)
-                if key in existing:
-                    continue
+        imported = {
+            "text": text,
+            "start": int(ply),
+            "source_file": src_file or None,
+            "source_label": item.get("source_label"),
+            "origin": "imported",
+            "source_comment_id": item.get("source_comment_id"),
+        }
 
-                src_label = payload.get("source") or Path(fp).name
-                st.session_state.comments.append(
-                    {
-                        "text": text,
-                        "start": s,
-                        "source_file": _resolve_path_str(fp),
-                        "source_label": src_label,
-                        "origin": "imported",
-                        "source_comment_id": c.get("id"),
-                    }
-                )
-                existing.add(key)
+        sig = _sig(imported)
+        if sig in existing:
+            continue
+
+        st.session_state.comments.append(imported)
+        existing.add(sig)
 
 
 def import_missing_comments_for_all_plies() -> None:
     """
-    For each prefix of the current move list, import original comments from any other
-    saved game with the same prefix at that ply.
+    For each ply in the current game, import comments from ANY other saved game
+    that reaches the same position before that ply's move and plays the same move.
+    (Transposition-aware; does NOT require prefix equality.)
     """
-    cur_moves = st.session_state.moves_san
-    if not cur_moves:
+    moves = st.session_state.get("moves_san", [])
+    if not moves:
         return
 
-    have_key = set()
-    for c in st.session_state.comments:
+    idx = build_comment_transposition_index_cached(_game_file_mtimes())
+
+    def _sig(c: dict) -> tuple:
         s = _safe_int(c.get("start", -1), -1)
+        sf = _resolve_path_str(c.get("source_file"))
+        cid = str(c.get("source_comment_id") or "")
         txt = str(c.get("text", "")).strip()
-        have_key.add((s, txt))
+        return (s, sf, cid if cid else txt)
 
-    cur_file_abs = _resolve_path_str(st.session_state.get("current_file"))
+    existing = set(_sig(c) for c in st.session_state.get("comments", []) if c.get("origin") == "imported")
 
-    for ply in range(len(cur_moves)):
-        prefix = cur_moves[: ply + 1]
+    cur_abs = _resolve_path_str(st.session_state.get("current_file"))
 
-        for fp in sorted(DATA_DIR.glob("game_*.json")):
-            if cur_file_abs and _paths_equal(fp, cur_file_abs):
+    b = chess.Board()
+    for ply, san in enumerate(moves):
+        pos_key = _fen4_key(b)
+
+        mv, _opts = parse_san_lenient(b, san)
+        if mv is None:
+            break
+
+        key = (pos_key, mv.uci())
+        hits = idx.get(key, [])
+
+        for item in hits:
+            src_file = _resolve_path_str(item.get("source_file"))
+            if cur_abs and _paths_equal(src_file, cur_abs):
                 continue
 
-            payload = _read_json(fp)
-            if not payload:
+            text = str(item.get("text", "")).strip()
+            if not text:
                 continue
 
-            saved_moves: List[str] = payload.get("moves_san", []) or []
-            if len(saved_moves) <= ply:
+            imported = {
+                "text": text,
+                "start": int(ply),                 # attach here in THIS game
+                "source_file": src_file or None,
+                "source_label": item.get("source_label"),
+                "origin": "imported",
+                "source_comment_id": item.get("source_comment_id"),
+            }
+
+            sig = _sig(imported)
+            if sig in existing:
                 continue
-            if saved_moves[: ply + 1] != prefix:
-                continue
 
-            src_label = payload.get("source") or Path(fp).name
-            for sc in payload.get("comments", []) or []:
-                if sc.get("origin") != "original":
-                    continue
+            st.session_state.comments.append(imported)
+            existing.add(sig)
 
-                s = _safe_int(sc.get("start", -1), -1)
-                if s != ply:
-                    continue
-
-                txt = str(sc.get("text", "")).strip()
-                if not txt:
-                    continue
-
-                if (s, txt) in have_key:
-                    continue
-
-                st.session_state.comments.append(
-                    {
-                        "text": txt,
-                        "start": s,
-                        "source_file": _resolve_path_str(fp),
-                        "source_label": src_label,
-                        "origin": "imported",
-                        "source_comment_id": sc.get("id"),
-                    }
-                )
-                have_key.add((s, txt))
+        b.push(mv)
 
 
 def _propagate_comment_edit_to_imports(source_file: str, source_comment_id: str, new_text: str, new_start: int) -> None:
