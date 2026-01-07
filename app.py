@@ -2854,7 +2854,14 @@ def on_add_comment() -> None:
     )
 
     st.session_state.new_comment_text = ""
-    st.session_state.flash = ""
+
+    # ✅ Persist immediately when working inside an existing saved game
+    if cur_file:
+        on_save_comments_to_current()
+        # Keep "dirty" baseline in sync since we just saved
+        st.session_state.loaded_snapshot = _snapshot_current_game_state()
+    else:
+        st.session_state.flash = ""
 
 
 def make_delete_comment(idx: int):
