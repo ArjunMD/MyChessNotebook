@@ -3867,7 +3867,6 @@ def render_tactic_right_panel() -> None:
         if st.session_state.get("tactic_show_notes", False):
             cur_tactic = st.session_state.get("tactic_current_file") or ""
             saved_note = str((payload or {}).get("note", "") or "")
-            
 
             # Seed editor when switching tactics OR if Streamlit wiped the widget while hidden
             if (
@@ -3891,125 +3890,125 @@ def render_tactic_right_panel() -> None:
             with n2:
                 st.button("Revert", on_click=on_revert_tactic_note, use_container_width=True)
 
-
             if st.session_state.get("tactic_note_flash"):
                 st.markdown(
                     f"<div class='flash'>{st.session_state.tactic_note_flash}</div>",
                     unsafe_allow_html=True,
                 )
 
-        with tab_manage:
-            # Build catalog (already cached by mtimes)
-            file_mtimes = _tactic_file_mtimes()
-            catalog = build_tactics_catalog_cached(file_mtimes)
+    # ✅ IMPORTANT: this is now OUTSIDE tab_info
+    with tab_manage:
+        # Build catalog (already cached by mtimes)
+        file_mtimes = _tactic_file_mtimes()
+        catalog = build_tactics_catalog_cached(file_mtimes)
 
-            total = len(catalog)
-            if total == 0:
-                st.caption("_No tactics saved yet._")
-                return
+        total = len(catalog)
+        if total == 0:
+            st.caption("_No tactics saved yet._")
+            return
 
-            # Controls
-            st.text_input(
-                "Search tactics",
-                key="tactic_manage_query",
-                placeholder="Search by source, trigger, tag…",
-                label_visibility="collapsed",
-            ) 
+        # Controls
+        st.text_input(
+            "Search tactics",
+            key="tactic_manage_query",
+            placeholder="Search by source, trigger, tag…",
+            label_visibility="collapsed",
+        )
 
-            # Reuse existing tag filter (same as training Filter tab)
-            selected = st.session_state.get("tactic_filter_tags", [])
-            match_all = bool(st.session_state.get("tactic_filter_match_all", False))
+        # Reuse existing tag filter (same as training Filter tab)
+        selected = st.session_state.get("tactic_filter_tags", [])
+        match_all = bool(st.session_state.get("tactic_filter_match_all", False))
 
-            q = (st.session_state.get("tactic_manage_query") or "").strip().lower()
-            lim = int(st.session_state.get("tactic_manage_limit", 50) or 50)
+        q = (st.session_state.get("tactic_manage_query") or "").strip().lower()
+        lim = int(st.session_state.get("tactic_manage_limit", 50) or 50)
 
-            def _matches(it: dict) -> bool:
-                payload = it.get("payload") or {}
-                tags = it.get("tags") or []
-                if selected and not _tactic_matches_selected_tags(tags, selected, match_all):
-                    return False
+        def _matches(it: dict) -> bool:
+            payload = it.get("payload") or {}
+            tags = it.get("tags") or []
+            if selected and not _tactic_matches_selected_tags(tags, selected, match_all):
+                return False
 
-                if not q:
-                    return True
+            if not q:
+                return True
 
-                label = str(payload.get("source_label") or "")
-                trig = _tactic_trigger_text(payload) or ""
-                name = Path(it.get("path") or "").name
-                hay = " ".join([label, trig, name, " ".join(tags)]).lower()
-                return q in hay
+            label = str(payload.get("source_label") or "")
+            trig = _tactic_trigger_text(payload) or ""
+            name = Path(it.get("path") or "").name
+            hay = " ".join([label, trig, name, " ".join(tags)]).lower()
+            return q in hay
 
-            filtered = [it for it in catalog if _matches(it)]
+        filtered = [it for it in catalog if _matches(it)]
 
-            st.caption(f"Showing: **{min(len(filtered), lim)}** / {len(filtered)} matched (total tactics: {total})")
+        st.caption(f"Showing: **{min(len(filtered), lim)}** / {len(filtered)} matched (total tactics: {total})")
 
-            pending = st.session_state.get("tactic_delete_pending")
+        pending = st.session_state.get("tactic_delete_pending")
 
-            for it in filtered[:lim]:
-                path_str = str(it.get("path") or "")
-                payload = it.get("payload") or {}
-                tags = it.get("tags") or []
+        for it in filtered[:lim]:
+            path_str = str(it.get("path") or "")
+            payload = it.get("payload") or {}
+            tags = it.get("tags") or []
 
-                src_label = (payload.get("source_label") or "").strip() or "(untitled)"
-                start_ply = _safe_int(payload.get("start_ply", 0), 0)
-                start_move_num = (start_ply // 2) + 1
-                trigger = _tactic_trigger_text(payload)
+            src_label = (payload.get("source_label") or "").strip() or "(untitled)"
+            start_ply = _safe_int(payload.get("start_ply", 0), 0)
+            start_move_num = (start_ply // 2) + 1
+            trigger = _tactic_trigger_text(payload)
 
-                # Compact row
-                st.markdown("<div class='comment-card'>", unsafe_allow_html=True)
-                title = f"**{src_label}**  <span class='small-muted'>· starts move {start_move_num}</span>"
-                st.markdown(title, unsafe_allow_html=True)
+            st.markdown("<div class='comment-card'>", unsafe_allow_html=True)
+            title = f"**{src_label}**  <span class='small-muted'>· starts move {start_move_num}</span>"
+            st.markdown(title, unsafe_allow_html=True)
 
-                meta_bits = []
-                if trigger:
-                    meta_bits.append(f"after {trigger}")
-                if tags:
-                    meta_bits.append(f"{len(tags)} tag(s)")
-                if meta_bits:
-                    st.caption(" · ".join(meta_bits))
+            meta_bits = []
+            if trigger:
+                meta_bits.append(f"after {trigger}")
+            if tags:
+                meta_bits.append(f"{len(tags)} tag(s)")
+            if meta_bits:
+                st.caption(" · ".join(meta_bits))
 
-                c1, c2, c3 = st.columns([0.34, 0.33, 0.33])
-                with c1:
-                    st.button(
-                        "Load / Train",
-                        key=f"tman_load_{Path(path_str).name}",
-                        use_container_width=True,
-                        on_click=make_load_tactic_from_manage(path_str, payload),
-                    )
-                with c2:
-                    st.button(
-                        "Go to game",
-                        key=f"tman_goto_{Path(path_str).name}",
-                        use_container_width=True,
-                        on_click=on_go_to_tactic_game,
-                        disabled=not _paths_equal(st.session_state.get("tactic_current_file"), path_str),
-                        help="Enabled only for the currently loaded tactic.",
-                    )
-                with c3:
-                    if pending == path_str:
-                        d1, d2 = st.columns(2)
-                        with d1:
-                            st.button(
-                                "Confirm",
-                                key=f"tman_del_yes_{Path(path_str).name}",
-                                use_container_width=True,
-                                on_click=make_delete_tactic_confirm(path_str),
-                            )
-                        with d2:
-                            st.button(
-                                "Cancel",
-                                key=f"tman_del_no_{Path(path_str).name}",
-                                use_container_width=True,
-                                on_click=on_cancel_delete_tactic,
-                            )
-                    else:
+            c1, c2, c3 = st.columns([0.34, 0.33, 0.33])
+            with c1:
+                st.button(
+                    "Load / Train",
+                    key=f"tman_load_{Path(path_str).name}",
+                    use_container_width=True,
+                    on_click=make_load_tactic_from_manage(path_str, payload),
+                )
+            with c2:
+                st.button(
+                    "Go to game",
+                    key=f"tman_goto_{Path(path_str).name}",
+                    use_container_width=True,
+                    on_click=on_go_to_tactic_game,
+                    disabled=not _paths_equal(st.session_state.get("tactic_current_file"), path_str),
+                    help="Enabled only for the currently loaded tactic.",
+                )
+            with c3:
+                if pending == path_str:
+                    d1, d2 = st.columns(2)
+                    with d1:
                         st.button(
-                            "Delete",
-                            key=f"tman_del_{Path(path_str).name}",
+                            "Confirm",
+                            key=f"tman_del_yes_{Path(path_str).name}",
                             use_container_width=True,
-                            on_click=lambda p=path_str: on_mark_delete_tactic(p),
+                            on_click=make_delete_tactic_confirm(path_str),
                         )
+                    with d2:
+                        st.button(
+                            "Cancel",
+                            key=f"tman_del_no_{Path(path_str).name}",
+                            use_container_width=True,
+                            on_click=on_cancel_delete_tactic,
+                        )
+                else:
+                    st.button(
+                        "Delete",
+                        key=f"tman_del_{Path(path_str).name}",
+                        use_container_width=True,
+                        on_click=lambda p=path_str: on_mark_delete_tactic(p),
+                    )
 
-                st.markdown("</div>", unsafe_allow_html=True)
+            st.markdown("</div>", unsafe_allow_html=True)
+
 
 
     with tab_filter:
